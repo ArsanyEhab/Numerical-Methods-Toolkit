@@ -1,23 +1,7 @@
 import numpy as np
 
 def secant_method(f, x0, x1, tol=1e-6, max_iter=100, print_table=True):
-    """
-    Secant Method: x_{n+1} = x_n - (x_n - x_{n-1})*f(x_n)/(f(x_n) - f(x_{n-1}))
-    
-    Parameters:
-    f: function - equation f(x)=0
-    x0, x1: float - initial guesses
-    tol: float - tolerance for convergence
-    max_iter: int - maximum number of iterations
-    print_table: bool - whether to print iteration table
-    
-    Returns:
-    root: float - approximated root
-    iterations: int - number of iterations performed
-    converged: bool - whether method converged
-    history: list - list of [iteration, x, f(x)] for each step
-    """
-    
+
     x_prev, x_curr = x0, x1
     history = [[0, x_prev, f(x_prev)], [1, x_curr, f(x_curr)]]
     
