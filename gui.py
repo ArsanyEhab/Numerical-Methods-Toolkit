@@ -60,6 +60,7 @@ METHOD_DESCRIPTIONS: dict[str, str] = {
     "simpson": "Composite Simpson's Rule (n must be even). Quartic-accurate.",
     "gauss_quad": "Gauss-Legendre quadrature with 1, 2 or 3 nodes (exact for polynomial degree 2k-1).",
     "romberg": "Romberg = trapezoidal rule + Richardson extrapolation. Very fast convergence.",
+    "double_trapz": "2D Composite Trapezoidal rule for \u222b\u222b f(x, y) dx dy on a rectangle.",
     "differentiation": "Finite-difference derivatives from a function or tabulated data.",
 }
 
@@ -108,6 +109,7 @@ METHOD_CATEGORY: dict[str, str] = {
     "jacobi": "systems", "gauss_seidel": "systems", "newton_system": "systems",
     "trapezoidal": "integration", "simpson": "integration",
     "gauss_quad": "integration", "romberg": "integration",
+    "double_trapz": "integration",
     "differentiation": "differentiation",
 }
 
@@ -450,6 +452,7 @@ SCRIPTS = {
     "simpson": MethodScript("Composite Simpson's Rule", "numerical_integration.py"),
     "gauss_quad": MethodScript("Gaussian Quadrature", "gaussian_quadrature.py"),
     "romberg": MethodScript("Romberg Integration", "romberg_integration.py"),
+    "double_trapz": MethodScript("Double Trapezoidal (2D)", "Trapz Double Integral.py"),
     "differentiation": MethodScript("Numerical Differentiation", "numerical_differentiation.py"),
 }
 
@@ -464,6 +467,36 @@ def _load_module_from_path(path: Path):
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+SAFE_DIV_FALLBACK = 0.001  # value substituted whenever a user expression yields
+                            # 1/0, 0/0, log(0), or any non-finite result.
+
+
+def _safe_finite(value):
+    """Replace inf / -inf / NaN with SAFE_DIV_FALLBACK.
+
+    Works for python scalars and numpy scalars/arrays.  Non-numeric inputs
+    are returned unchanged (caller can decide what to do with them).
+    """
+    try:
+        arr = np.asarray(value)
+    except Exception:
+        return value
+    if arr.dtype.kind not in "fcui":  # not a numeric dtype
+        return value
+    if arr.shape == ():  # scalar
+        v = arr.item()
+        try:
+            if not np.isfinite(v):
+                return SAFE_DIV_FALLBACK
+        except TypeError:
+            return value
+        return value
+    arr_f = arr.astype(float, copy=False)
+    if np.all(np.isfinite(arr_f)):
+        return value
+    return np.where(np.isfinite(arr_f), arr_f, SAFE_DIV_FALLBACK)
 
 
 def _make_function(expr: str) -> Callable[[float], float]:
@@ -488,7 +521,19 @@ def _make_function(expr: str) -> Callable[[float], float]:
     }
 
     def f(x: float) -> float:
-        return eval(expr, {"__builtins__": {}}, {**allowed, "x": x})
+        try:
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                v = eval(expr, {"__builtins__": {}}, {**allowed, "x": x})
+        except (ZeroDivisionError, FloatingPointError):
+            return SAFE_DIV_FALLBACK
+        except ValueError:
+            # math.log(0), math.sqrt(-1), etc.
+            return SAFE_DIV_FALLBACK
+        safe = _safe_finite(v)
+        try:
+            return float(safe)
+        except Exception:
+            return SAFE_DIV_FALLBACK
 
     return f
 
@@ -527,7 +572,63 @@ def _make_array_function(expr: str) -> Callable:
     code = compile(expr_norm, "<expr>", "eval")
 
     def f(x):
-        return eval(code, {"__builtins__": {}}, {**allowed, "x": x})
+        try:
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                v = eval(code, {"__builtins__": {}}, {**allowed, "x": x})
+        except (ZeroDivisionError, FloatingPointError, ValueError):
+            return (np.full_like(np.asarray(x, dtype=float), SAFE_DIV_FALLBACK)
+                    if hasattr(x, "__len__") or isinstance(x, np.ndarray)
+                    else SAFE_DIV_FALLBACK)
+        return _safe_finite(v)
+
+    return f
+
+
+def _make_2d_array_function(expr: str) -> Callable:
+    """Build a function f(x, y) that works on numpy arrays for both args.
+
+    Used by 2D integration (e.g. double trapezoidal rule).
+    """
+    expr_norm = _normalize_user_expr(expr)
+    if not expr_norm:
+        raise ValueError("Function expression is empty.")
+
+    allowed = {
+        "np": np,
+        "abs": np.abs,
+        "pow": np.power,
+        "sin": np.sin,
+        "cos": np.cos,
+        "tan": np.tan,
+        "asin": np.arcsin,
+        "acos": np.arccos,
+        "atan": np.arctan,
+        "atan2": np.arctan2,
+        "sinh": np.sinh,
+        "cosh": np.cosh,
+        "tanh": np.tanh,
+        "exp": np.exp,
+        "log": np.log,
+        "ln": np.log,
+        "log10": np.log10,
+        "sqrt": np.sqrt,
+        "pi": np.pi,
+        "e": np.e,
+    }
+
+    code = compile(expr_norm, "<expr>", "eval")
+
+    def f(x, y):
+        try:
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                v = eval(code, {"__builtins__": {}}, {**allowed, "x": x, "y": y})
+        except (ZeroDivisionError, FloatingPointError, ValueError):
+            try:
+                shape = np.broadcast(np.asarray(x), np.asarray(y)).shape
+                return np.full(shape, SAFE_DIV_FALLBACK, dtype=float)
+            except Exception:
+                return SAFE_DIV_FALLBACK
+        return _safe_finite(v)
 
     return f
 
@@ -618,7 +719,18 @@ def _make_system_expr(expr: str, n: int) -> Callable[[np.ndarray], float]:
         local: dict[str, float] = {"x": x, "y": y}
         if n == 3:
             local["z"] = float(v[2])
-        return float(eval(code, {"__builtins__": {}}, {**allowed, **local}))
+        try:
+            with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+                raw = eval(code, {"__builtins__": {}}, {**allowed, **local})
+        except (ZeroDivisionError, FloatingPointError, ValueError):
+            return SAFE_DIV_FALLBACK
+        try:
+            out = float(raw)
+        except Exception:
+            return SAFE_DIV_FALLBACK
+        if not math.isfinite(out):
+            return SAFE_DIV_FALLBACK
+        return out
 
     return f
 
@@ -846,6 +958,7 @@ class App(tk.Tk):
                 ("Composite Simpson's", "simpson", self.open_simpson),
                 ("Gaussian Quadrature", "gauss_quad", self.open_gauss_quadrature),
                 ("Romberg Integration", "romberg", self.open_romberg),
+                ("Double Trapezoidal (2D)", "double_trapz", self.open_double_trapz),
             ],
             "differentiation": [
                 ("Numerical Differentiation", "differentiation", self.open_differentiation),
@@ -1116,6 +1229,20 @@ class App(tk.Tk):
                 x_data, y_data, x_targets, derivs, f=f, title=title
             )
             self._open_figures.append((fig, ax, ani))
+            plt.show(block=False)
+        except Exception as e:
+            messagebox.showerror("Graph failed", str(e))
+
+    def _open_double_trapz_graph(self, *, f, a, b, c, d, nx, ny,
+                                 integral_value, title):
+        try:
+            import matplotlib.pyplot as plt
+            from graph import plot_double_trapz
+
+            fig, ax = plot_double_trapz(
+                f, a, b, c, d, nx, ny, integral_value, title=title
+            )
+            self._open_figures.append((fig, ax, None))
             plt.show(block=False)
         except Exception as e:
             messagebox.showerror("Graph failed", str(e))
@@ -1960,6 +2087,70 @@ class App(tk.Tk):
         except Exception:
             pass
 
+    def open_double_trapz(self):
+        if not self._ensure_exists(SCRIPTS["double_trapz"]):
+            return
+        mod = _load_module_from_path(SCRIPTS["double_trapz"].path)
+        double_trapz = getattr(mod, "double_trapz", None)
+        if double_trapz is None:
+            messagebox.showerror(
+                "Missing function",
+                "Could not find `double_trapz` in Trapz Double Integral.py",
+            )
+            return
+
+        win = MethodWindow(
+            self,
+            title="Double Trapezoidal (2D)",
+            subtitle=METHOD_DESCRIPTIONS["double_trapz"],
+            category=METHOD_CATEGORY["double_trapz"],
+            fields=[
+                Field("f(x, y)", "x**2 + y**2",
+                      help="2D function. Use both x and y, e.g. sin(x)*cos(y), x*y, exp(-(x**2+y**2))."),
+                Field("a  (x lower)", "0"),
+                Field("b  (x upper)", "2", help="Supports expressions like pi, 2*pi/3."),
+                Field("c  (y lower)", "0"),
+                Field("d  (y upper)", "3"),
+                Field("nx (x grid points)", "100",
+                      kind="spin", spin_from=2, spin_to=10000),
+                Field("ny (y grid points)", "100",
+                      kind="spin", spin_from=2, spin_to=10000),
+                Field("print_table (0/1)", "1", kind="check"),
+            ],
+            on_run=lambda values, out: self._run_double_trapz(double_trapz, values, out),
+        )
+        win.show()
+
+    def _run_double_trapz(self, double_trapz, values: dict, out_widget: "OutputBox"):
+        try:
+            f = _make_2d_array_function(values["f(x, y)"])
+            a = float(_make_array_function(values["a  (x lower)"])(0.0))
+            b = float(_make_array_function(values["b  (x upper)"])(0.0))
+            c = float(_make_array_function(values["c  (y lower)"])(0.0))
+            d = float(_make_array_function(values["d  (y upper)"])(0.0))
+            nx = int(float(values["nx (x grid points)"]))
+            ny = int(float(values["ny (y grid points)"]))
+            print_table = bool(int(float(values["print_table (0/1)"])))
+            if nx < 2 or ny < 2:
+                raise ValueError("nx and ny must both be >= 2.")
+            if b <= a or d <= c:
+                raise ValueError("Need b > a and d > c.")
+        except Exception as e:
+            messagebox.showerror("Invalid input", str(e))
+            return
+
+        def runner():
+            return double_trapz(f, a, b, c, d, nx, ny, print_table=print_table)
+
+        out_text, integral = _run_and_capture_with_result(runner)
+        out_widget.set_text(out_text)
+        if integral is not None:
+            self._open_double_trapz_graph(
+                f=f, a=a, b=b, c=c, d=d, nx=nx, ny=ny,
+                integral_value=float(integral),
+                title=f"Double Trapezoidal on [{a},{b}] x [{c},{d}]",
+            )
+
     def open_differentiation(self):
         if not self._ensure_exists(SCRIPTS["differentiation"]):
             return
@@ -2100,6 +2291,109 @@ class OutputBox(ttk.Frame):
             pass
 
 
+class OutputWindow:
+    """Standalone Toplevel that hosts an OutputBox.
+
+    Created lazily by `MethodWindow` on first Run and reused on subsequent
+    runs.  Closes automatically when its parent MethodWindow closes.
+    """
+
+    def __init__(self, parent: tk.Misc, *, title: str,
+                 category: Optional[str] = None):
+        self._title = title
+        self._category = category
+
+        self.win = tk.Toplevel(parent)
+        self.win.title(f"{title} \u2014 Output")
+        self.win.geometry("780x540")
+        self.win.minsize(520, 320)
+        _apply_global_theme(self.win)
+        self.win.configure(background=COLORS["bg"])
+
+        accent = (CATEGORY_INFO.get(category, {}) or {}).get("color", COLORS["accent"])
+        tk.Frame(self.win, bg=accent, height=3).pack(fill="x")
+
+        outer = ttk.Frame(self.win, padding=18, style="App.TFrame")
+        outer.pack(fill="both", expand=True)
+
+        # Header
+        header = tk.Frame(outer, bg=COLORS["bg"])
+        header.pack(fill="x")
+        if category and category in CATEGORY_INFO:
+            cinfo = CATEGORY_INFO[category]
+            tk.Label(
+                header, text=cinfo["icon"], fg=cinfo["color"], bg=COLORS["bg"],
+                font=("Segoe UI", 22, "bold"),
+            ).pack(side="left")
+            text_wrap = tk.Frame(header, bg=COLORS["bg"])
+            text_wrap.pack(side="left", padx=(12, 0), anchor="w")
+            ttk.Label(text_wrap, text=title, style="Header.TLabel").pack(anchor="w")
+            ttk.Label(text_wrap, text="Computed result and step-by-step breakdown.",
+                      style="Sub.TLabel").pack(anchor="w", pady=(2, 0))
+
+            chip = tk.Label(
+                header, text=f"  {cinfo['icon']}  {cinfo['label']}  ",
+                bg=_MethodCard._tint(cinfo["color"]),
+                fg=cinfo["color"],
+                font=("Segoe UI", 9, "bold"), padx=4, pady=3,
+            )
+            chip.pack(side="right", anchor="ne")
+        else:
+            ttk.Label(header, text=f"{title} \u2014 Output",
+                      style="Header.TLabel").pack(anchor="w")
+
+        tk.Frame(outer, bg=COLORS["border"], height=1).pack(fill="x", pady=(14, 12))
+
+        self.output = OutputBox(outer)
+        self.output.pack(fill="both", expand=True)
+
+        self.win.bind("<Escape>", lambda _e: self.destroy())
+
+    def position_beside(self, other: tk.Misc) -> None:
+        """Place this window to the right of `other`, falling back to below."""
+        try:
+            other.update_idletasks()
+            self.win.update_idletasks()
+            ox = other.winfo_rootx()
+            oy = other.winfo_rooty()
+            ow = other.winfo_width()
+            oh = other.winfo_height()
+            sw = other.winfo_screenwidth()
+            sh = other.winfo_screenheight()
+            mw = self.win.winfo_width() or self.win.winfo_reqwidth()
+            mh = self.win.winfo_height() or self.win.winfo_reqheight()
+
+            x = ox + ow + 12
+            y = oy
+            if x + mw > sw - 8:
+                x = max(8, ox)
+                y = oy + oh + 12
+                if y + mh > sh - 40:
+                    y = max(8, sh - mh - 40)
+            self.win.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except tk.TclError:
+            pass
+
+    def show(self) -> None:
+        try:
+            self.win.deiconify()
+            self.win.lift()
+        except tk.TclError:
+            pass
+
+    def alive(self) -> bool:
+        try:
+            return bool(self.win.winfo_exists())
+        except tk.TclError:
+            return False
+
+    def destroy(self) -> None:
+        try:
+            self.win.destroy()
+        except tk.TclError:
+            pass
+
+
 class _ScrollableFrame(ttk.Frame):
     """Vertical scrollable container that resizes its inner frame to its width."""
 
@@ -2160,10 +2454,13 @@ class MethodWindow:
 
         self.win = tk.Toplevel(root)
         self.win.title(title)
-        self.win.geometry("820x680")
-        self.win.minsize(740, 580)
+        self.win.geometry("720x560")
+        self.win.minsize(620, 460)
         _apply_global_theme(self.win)
         self.win.configure(background=COLORS["bg"])
+
+        # Output lives in its own window now, created lazily on Run.
+        self._output_window: Optional[OutputWindow] = None
 
         # Top accent strip (uses the category color when known)
         accent = (CATEGORY_INFO.get(category, {}) or {}).get("color", COLORS["accent"])
@@ -2255,21 +2552,55 @@ class MethodWindow:
         self.status_chip.pack(side="left")
         ttk.Label(
             status_row,
-            text="  Press Enter to run, Esc to close.",
+            text="  Press Enter to run, Esc to close.  "
+                 "Output appears in a separate window.",
             style="Status.TLabel",
         ).pack(side="left")
 
-        # ---------- Output ----------
-        self.output = OutputBox(outer)
-        self.output.pack(fill="both", expand=True)
+        # Bottom hint card directing the user to the (separate) output window.
+        hint = tk.Frame(outer, bg=COLORS["accent_lo"], highlightthickness=1,
+                        highlightbackground=COLORS["border"])
+        hint.pack(fill="x", pady=(8, 0))
+        tk.Label(
+            hint, text="\u2192", fg=COLORS["accent_hi"], bg=COLORS["accent_lo"],
+            font=("Segoe UI", 14, "bold"), padx=10, pady=8,
+        ).pack(side="left")
+        tk.Label(
+            hint,
+            text="The result, matrix and formula breakdown will open in the\n"
+                 "Output window the first time you press Run.",
+            bg=COLORS["accent_lo"], fg=COLORS["text"],
+            font=("Segoe UI", 9), justify="left", pady=8,
+        ).pack(side="left", anchor="w")
 
         # Shortcuts
         self.win.bind("<Return>", lambda _e: self._run())
         self.win.bind("<KP_Enter>", lambda _e: self._run())
         self.win.bind("<Escape>", lambda _e: self.win.destroy())
 
+        # Tear down the output window together with the input window.
+        self.win.bind("<Destroy>", self._on_destroy)
+
         if first_widget is not None:
             first_widget.focus_set()
+
+    def _on_destroy(self, event):
+        if event.widget is not self.win:
+            return  # ignore child-widget destroy events
+        if self._output_window is not None:
+            self._output_window.destroy()
+            self._output_window = None
+
+    def _ensure_output_window(self) -> OutputWindow:
+        """Create the output window on first use; reuse it on subsequent runs."""
+        if self._output_window is None or not self._output_window.alive():
+            self._output_window = OutputWindow(
+                self.win, title=self.title, category=self.category
+            )
+            self._output_window.position_beside(self.win)
+        else:
+            self._output_window.show()
+        return self._output_window
 
     def _build_widget(self, master: tk.Widget, fld: Field) -> tk.Widget:
         if fld.kind == "combo":
@@ -2306,7 +2637,8 @@ class MethodWindow:
 
     def show(self):
         self.win.transient(self.root)
-        self.win.grab_set()
+        # No grab_set on purpose: the output is in a separate Toplevel and
+        # the user must be free to interact with both windows.
         _center_on_screen(self.win, self.root)
         self.win.focus_set()
 
@@ -2315,11 +2647,14 @@ class MethodWindow:
         self.status_chip.set("Computing...", "running")
         self.run_btn.state(["disabled"])
         self.win.update_idletasks()
+
+        out_win = self._ensure_output_window()
         t0 = time.perf_counter()
         try:
-            self.on_run(values, self.output)
+            self.on_run(values, out_win.output)
             dt_ms = (time.perf_counter() - t0) * 1000.0
             self.status_chip.set(f"Done in {dt_ms:.1f} ms", "done")
+            out_win.show()
         except Exception as e:
             self.status_chip.set(f"Error: {e}", "error")
             raise

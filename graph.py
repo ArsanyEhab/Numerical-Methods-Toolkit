@@ -578,3 +578,70 @@ def plot_numerical_derivative(
     ani = FuncAnimation(fig, update, frames=frames, interval=interval,
                         repeat=repeat, blit=False)
     return fig, ax, ani
+
+
+def plot_double_trapz(
+    f,
+    a: float,
+    b: float,
+    c: float,
+    d: float,
+    nx: int,
+    ny: int,
+    integral_value: float,
+    *,
+    title: str = "Double Trapezoidal (2D)",
+):
+    """Plot the surface z = f(x, y) on [a, b] x [c, d] together with the
+    trapezoidal sample grid, and annotate the computed volume.
+
+    Returns
+    -------
+    fig, ax  (3D Axes)
+    """
+    # Local import keeps matplotlib optional for the rest of the app.
+    from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3d projection)
+
+    # Smooth surface for visualisation
+    nx_plot = max(nx, 60)
+    ny_plot = max(ny, 60)
+    xs = np.linspace(a, b, nx_plot)
+    ys = np.linspace(c, d, ny_plot)
+    Xs, Ys = np.meshgrid(xs, ys, indexing="ij")
+    try:
+        Zs = f(Xs, Ys)
+    except Exception:
+        Zs = np.vectorize(f)(Xs, Ys)
+    Zs = np.asarray(Zs, dtype=float)
+
+    fig = plt.figure(figsize=(8.4, 6.0))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.plot_surface(
+        Xs, Ys, Zs,
+        cmap="viridis", alpha=0.85,
+        rstride=max(1, nx_plot // 40), cstride=max(1, ny_plot // 40),
+        linewidth=0, antialiased=True,
+    )
+
+    # Overlay actual sampling grid as scatter points (downsampled if dense)
+    xg = np.linspace(a, b, nx)
+    yg = np.linspace(c, d, ny)
+    step_x = max(1, nx // 20)
+    step_y = max(1, ny // 20)
+    Xg, Yg = np.meshgrid(xg[::step_x], yg[::step_y], indexing="ij")
+    try:
+        Zg = f(Xg, Yg)
+    except Exception:
+        Zg = np.vectorize(f)(Xg, Yg)
+    ax.scatter(Xg, Yg, Zg, color="red", s=8, depthshade=True,
+               label="grid samples")
+
+    ax.set_xlabel("x")
+    ax.set_ylabel("y")
+    ax.set_zlabel("f(x, y)")
+    ax.set_title(
+        f"{title}\nnx = {nx}, ny = {ny}    \u222b\u222b f \u2248 {integral_value:.10f}"
+    )
+    ax.legend(loc="upper left")
+    fig.tight_layout()
+    return fig, ax
